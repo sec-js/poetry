@@ -1,66 +1,81 @@
 from __future__ import annotations
 
-import hashlib
-import json
-import tarfile
+import os
 import tempfile
-import zipfile
 
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 from typing import TYPE_CHECKING
-from typing import Callable
-from typing import Collection
 
 from build import BuildBackendException
 from build import ProjectBuilder
 from build.env import IsolatedEnv as BaseIsolatedEnv
 from poetry.core.utils.helpers import temporary_directory
-from pyproject_hooks import quiet_subprocess_runner  # type: ignore[import]
+from pyproject_hooks import quiet_subprocess_runner  # type: ignore[import-untyped]
 
-from poetry.installation.chooser import InvalidWheelName
-from poetry.installation.chooser import Wheel
+from poetry.utils._compat import decode
 from poetry.utils.env import ephemeral_environment
+from poetry.utils.helpers import extractall
 
 
 if TYPE_CHECKING:
-    from contextlib import AbstractContextManager
+    from collections.abc import Collection
 
-    from poetry.core.packages.utils.link import Link
-
-    from poetry.config.config import Config
+    from poetry.repositories import RepositoryPool
+    from poetry.utils.cache import ArtifactCache
     from poetry.utils.env import Env
 
 
-class ChefError(Exception):
-    ...
+class ChefError(Exception): ...
 
 
-class ChefBuildError(ChefError):
-    ...
+class ChefBuildError(ChefError): ...
+
+
+class ChefInstallError(ChefError):
+    def __init__(self, requirements: Collection[str], output: str, error: str) -> None:
+        message = "\n\n".join(
+            (
+                f"Failed to install {', '.join(requirements)}.",
+                f"Output:\n{output}",
+                f"Error:\n{error}",
+            )
+        )
+        super().__init__(message)
+        self._requirements = requirements
+
+    @property
+    def requirements(self) -> Collection[str]:
+        return self._requirements
 
 
 class IsolatedEnv(BaseIsolatedEnv):
-    def __init__(self, env: Env, config: Config) -> None:
+    def __init__(self, env: Env, pool: RepositoryPool) -> None:
         self._env = env
-        self._config = config
+        self._pool = pool
 
     @property
-    def executable(self) -> str:
+    def python_executable(self) -> str:
         return str(self._env.python)
 
-    @property
-    def scripts_dir(self) -> str:
-        return str(self._env._bin_dir)
+    def make_extra_environ(self) -> dict[str, str]:
+        path = os.environ.get("PATH")
+        scripts_dir = str(self._env._bin_dir)
+        return {
+            "PATH": (
+                os.pathsep.join([scripts_dir, path])
+                if path is not None
+                else scripts_dir
+            )
+        }
 
     def install(self, requirements: Collection[str]) -> None:
-        from cleo.io.null_io import NullIO
+        from cleo.io.buffered_io import BufferedIO
         from poetry.core.packages.dependency import Dependency
         from poetry.core.packages.project_package import ProjectPackage
 
         from poetry.config.config import Config
-        from poetry.factory import Factory
         from poetry.installation.installer import Installer
         from poetry.packages.locker import Locker
         from poetry.repositories.installed_repository import InstalledRepository
@@ -72,27 +87,28 @@ class IsolatedEnv(BaseIsolatedEnv):
             dependency = Dependency.create_from_pep_508(requirement)
             package.add_dependency(dependency)
 
-        pool = Factory.create_pool(self._config)
+        io = BufferedIO()
         installer = Installer(
-            NullIO(),
+            io,
             self._env,
             package,
             Locker(self._env.path.joinpath("poetry.lock"), {}),
-            pool,
+            self._pool,
             Config.create(),
             InstalledRepository.load(self._env),
         )
         installer.update(True)
-        installer.run()
+        if installer.run() != 0:
+            raise ChefInstallError(requirements, io.fetch_output(), io.fetch_error())
 
 
 class Chef:
-    def __init__(self, config: Config, env: Env) -> None:
-        self._config = config
+    def __init__(
+        self, artifact_cache: ArtifactCache, env: Env, pool: RepositoryPool
+    ) -> None:
         self._env = env
-        self._cache_dir = (
-            Path(config.get("cache-dir")).expanduser().joinpath("artifacts")
-        )
+        self._pool = pool
+        self._artifact_cache = artifact_cache
 
     def prepare(
         self, archive: Path, output_dir: Path | None = None, *, editable: bool = False
@@ -101,9 +117,8 @@ class Chef:
             return archive
 
         if archive.is_dir():
-            tmp_dir = tempfile.mkdtemp(prefix="poetry-chef-")
-
-            return self._prepare(archive, Path(tmp_dir), editable=editable)
+            destination = output_dir or Path(tempfile.mkdtemp(prefix="poetry-chef-"))
+            return self._prepare(archive, destination=destination, editable=editable)
 
         return self._prepare_sdist(archive, destination=output_dir)
 
@@ -113,12 +128,9 @@ class Chef:
         from subprocess import CalledProcessError
 
         with ephemeral_environment(self._env.python) as venv:
-            env = IsolatedEnv(venv, self._config)
-            builder = ProjectBuilder(
-                directory,
-                python_executable=env.executable,
-                scripts_dir=env.scripts_dir,
-                runner=quiet_subprocess_runner,
+            env = IsolatedEnv(venv, self._pool)
+            builder = ProjectBuilder.from_isolated_env(
+                env, directory, runner=quiet_subprocess_runner
             )
             env.install(builder.build_system_requires)
 
@@ -126,26 +138,25 @@ class Chef:
             error: Exception | None = None
             try:
                 with redirect_stdout(stdout):
+                    dist_format = "wheel" if not editable else "editable"
                     env.install(
                         builder.build_system_requires
-                        | builder.get_requires_for_build("wheel")
+                        | builder.get_requires_for_build(dist_format)
                     )
                     path = Path(
                         builder.build(
-                            "wheel" if not editable else "editable",
+                            dist_format,
                             destination.as_posix(),
                         )
                     )
             except BuildBackendException as e:
                 message_parts = [str(e)]
-                if isinstance(e.exception, CalledProcessError) and (
-                    e.exception.stdout is not None or e.exception.stderr is not None
-                ):
-                    message_parts.append(
-                        e.exception.stderr.decode()
-                        if e.exception.stderr is not None
-                        else e.exception.stdout.decode()
-                    )
+                if isinstance(e.exception, CalledProcessError):
+                    text = e.exception.stderr or e.exception.stdout
+                    if text is not None:
+                        message_parts.append(decode(text))
+                else:
+                    message_parts.append(str(e.exception))
 
                 error = ChefBuildError("\n\n".join(message_parts))
 
@@ -158,19 +169,11 @@ class Chef:
         from poetry.core.packages.utils.link import Link
 
         suffix = archive.suffix
-        context: Callable[
-            [str], AbstractContextManager[zipfile.ZipFile | tarfile.TarFile]
-        ]
-        if suffix == ".zip":
-            context = zipfile.ZipFile
-        else:
-            context = tarfile.open
+        zip = suffix == ".zip"
 
         with temporary_directory() as tmp_dir:
-            with context(archive.as_posix()) as archive_archive:
-                archive_archive.extractall(tmp_dir)
-
             archive_dir = Path(tmp_dir)
+            extractall(source=archive, dest=archive_dir, zip=zip)
 
             elements = list(archive_dir.glob("*"))
 
@@ -182,7 +185,9 @@ class Chef:
                     sdist_dir = archive_dir
 
             if destination is None:
-                destination = self.get_cache_directory_for_link(Link(archive.as_uri()))
+                destination = self._artifact_cache.get_cache_directory_for_link(
+                    Link(archive.as_uri())
+                )
 
             destination.mkdir(parents=True, exist_ok=True)
 
@@ -197,66 +202,3 @@ class Chef:
     @classmethod
     def _is_wheel(cls, archive: Path) -> bool:
         return archive.suffix == ".whl"
-
-    def get_cached_archive_for_link(self, link: Link) -> Path | None:
-        archives = self.get_cached_archives_for_link(link)
-        if not archives:
-            return None
-
-        candidates: list[tuple[float | None, Path]] = []
-        for archive in archives:
-            if archive.suffix != ".whl":
-                candidates.append((float("inf"), archive))
-                continue
-
-            try:
-                wheel = Wheel(archive.name)
-            except InvalidWheelName:
-                continue
-
-            if not wheel.is_supported_by_environment(self._env):
-                continue
-
-            candidates.append(
-                (wheel.get_minimum_supported_index(self._env.supported_tags), archive),
-            )
-
-        if not candidates:
-            return None
-
-        return min(candidates)[1]
-
-    def get_cached_archives_for_link(self, link: Link) -> list[Path]:
-        cache_dir = self.get_cache_directory_for_link(link)
-
-        archive_types = ["whl", "tar.gz", "tar.bz2", "bz2", "zip"]
-        paths = []
-        for archive_type in archive_types:
-            for archive in cache_dir.glob(f"*.{archive_type}"):
-                paths.append(Path(archive))
-
-        return paths
-
-    def get_cache_directory_for_link(self, link: Link) -> Path:
-        key_parts = {"url": link.url_without_fragment}
-
-        if link.hash_name is not None and link.hash is not None:
-            key_parts[link.hash_name] = link.hash
-
-        if link.subdirectory_fragment:
-            key_parts["subdirectory"] = link.subdirectory_fragment
-
-        key_parts["interpreter_name"] = self._env.marker_env["interpreter_name"]
-        key_parts["interpreter_version"] = "".join(
-            self._env.marker_env["interpreter_version"].split(".")[:2]
-        )
-
-        key = hashlib.sha256(
-            json.dumps(
-                key_parts, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-            ).encode("ascii")
-        ).hexdigest()
-
-        split_key = [key[:2], key[2:4], key[4:6], key[6:]]
-
-        return self._cache_dir.joinpath(*split_key)

@@ -1,17 +1,17 @@
 from __future__ import annotations
 
 import json
-import os
 
 from pathlib import Path
 from typing import Any
 
-import jsonschema
+import fastjsonschema
 
+from fastjsonschema.exceptions import JsonSchemaException
 from poetry.core.json import SCHEMA_DIR as CORE_SCHEMA_DIR
 
 
-SCHEMA_DIR = os.path.join(os.path.dirname(__file__), "schemas")
+SCHEMA_DIR = Path(__file__).parent / "schemas"
 
 
 class ValidationError(ValueError):
@@ -22,24 +22,16 @@ def validate_object(obj: dict[str, Any]) -> list[str]:
     schema_file = Path(SCHEMA_DIR, "poetry.json")
     schema = json.loads(schema_file.read_text(encoding="utf-8"))
 
-    validator = jsonschema.Draft7Validator(schema)
-    validation_errors = sorted(
-        validator.iter_errors(obj),
-        key=lambda e: e.path,  # type: ignore[no-any-return]
-    )
+    validate = fastjsonschema.compile(schema)
 
     errors = []
-
-    for error in validation_errors:
-        message = error.message
-        if error.path:
-            path = ".".join(str(x) for x in error.absolute_path)
-            message = f"[{path}] {message}"
-
-        errors.append(message)
+    try:
+        validate(obj)
+    except JsonSchemaException as e:
+        errors = [e.message]
 
     core_schema = json.loads(
-        Path(CORE_SCHEMA_DIR, "poetry-schema.json").read_text(encoding="utf-8")
+        (CORE_SCHEMA_DIR / "poetry-schema.json").read_text(encoding="utf-8")
     )
 
     properties = {*schema["properties"].keys(), *core_schema["properties"].keys()}

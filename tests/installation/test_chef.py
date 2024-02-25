@@ -1,26 +1,39 @@
 from __future__ import annotations
 
+import os
+import shutil
+import sys
+import tempfile
+
 from pathlib import Path
 from typing import TYPE_CHECKING
 from zipfile import ZipFile
 
 import pytest
 
-from packaging.tags import Tag
+from build import ProjectBuilder
 from poetry.core.packages.utils.link import Link
 
 from poetry.factory import Factory
 from poetry.installation.chef import Chef
+from poetry.installation.chef import ChefInstallError
+from poetry.installation.chef import IsolatedEnv
+from poetry.puzzle.exceptions import SolverProblemError
+from poetry.puzzle.provider import IncompatibleConstraintsError
 from poetry.repositories import RepositoryPool
 from poetry.utils.env import EnvManager
-from poetry.utils.env import MockEnv
+from poetry.utils.env import ephemeral_environment
 from tests.repositories.test_pypi_repository import MockRepository
 
 
 if TYPE_CHECKING:
+    from collections.abc import Collection
+
     from pytest_mock import MockerFixture
 
+    from poetry.utils.cache import ArtifactCache
     from tests.conftest import Config
+    from tests.types import FixtureDirGetter
 
 
 @pytest.fixture()
@@ -37,103 +50,55 @@ def setup(mocker: MockerFixture, pool: RepositoryPool) -> None:
     mocker.patch.object(Factory, "create_pool", return_value=pool)
 
 
+def test_isolated_env_install_success(
+    pool: RepositoryPool, mock_file_downloads: None
+) -> None:
+    with ephemeral_environment(Path(sys.executable)) as venv:
+        env = IsolatedEnv(venv, pool)
+        assert "poetry-core" not in venv.run("pip", "freeze")
+        env.install({"poetry-core"})
+        assert "poetry-core" in venv.run("pip", "freeze")
+
+
 @pytest.mark.parametrize(
-    ("link", "cached"),
+    ("requirements", "exception"),
     [
-        (
-            "https://files.python-poetry.org/demo-0.1.0.tar.gz",
-            "/cache/demo-0.1.0-cp38-cp38-macosx_10_15_x86_64.whl",
-        ),
-        (
-            "https://example.com/demo-0.1.0-cp38-cp38-macosx_10_15_x86_64.whl",
-            "/cache/demo-0.1.0-cp38-cp38-macosx_10_15_x86_64.whl",
-        ),
+        ({"poetry-core==1.5.0", "poetry-core==1.6.0"}, IncompatibleConstraintsError),
+        ({"black==19.10b0", "attrs==17.4.0"}, SolverProblemError),
     ],
 )
-def test_get_cached_archive_for_link(
-    config: Config, mocker: MockerFixture, link: str, cached: str
-):
+def test_isolated_env_install_error(
+    requirements: Collection[str], exception: type[Exception], pool: RepositoryPool
+) -> None:
+    with ephemeral_environment(Path(sys.executable)) as venv:
+        env = IsolatedEnv(venv, pool)
+        with pytest.raises(exception):
+            env.install(requirements)
+
+
+def test_isolated_env_install_failure(
+    pool: RepositoryPool, mocker: MockerFixture
+) -> None:
+    mocker.patch("poetry.installation.installer.Installer.run", return_value=1)
+    with ephemeral_environment(Path(sys.executable)) as venv:
+        env = IsolatedEnv(venv, pool)
+        with pytest.raises(ChefInstallError) as e:
+            env.install({"a", "b>1"})
+        assert e.value.requirements == {"a", "b>1"}
+
+
+def test_prepare_sdist(
+    config: Config,
+    config_cache_dir: Path,
+    artifact_cache: ArtifactCache,
+    fixture_dir: FixtureDirGetter,
+    mock_file_downloads: None,
+) -> None:
     chef = Chef(
-        config,
-        MockEnv(
-            version_info=(3, 8, 3),
-            marker_env={"interpreter_name": "cpython", "interpreter_version": "3.8.3"},
-            supported_tags=[
-                Tag("cp38", "cp38", "macosx_10_15_x86_64"),
-                Tag("py3", "none", "any"),
-            ],
-        ),
+        artifact_cache, EnvManager.get_system_env(), Factory.create_pool(config)
     )
-
-    mocker.patch.object(
-        chef,
-        "get_cached_archives_for_link",
-        return_value=[
-            Path("/cache/demo-0.1.0-py2.py3-none-any"),
-            Path("/cache/demo-0.1.0.tar.gz"),
-            Path("/cache/demo-0.1.0-cp38-cp38-macosx_10_15_x86_64.whl"),
-            Path("/cache/demo-0.1.0-cp37-cp37-macosx_10_15_x86_64.whl"),
-        ],
-    )
-
-    archive = chef.get_cached_archive_for_link(Link(link))
-
-    assert Path(cached) == archive
-
-
-def test_get_cached_archives_for_link(config: Config, mocker: MockerFixture):
-    chef = Chef(
-        config,
-        MockEnv(
-            marker_env={"interpreter_name": "cpython", "interpreter_version": "3.8.3"}
-        ),
-    )
-
-    distributions = Path(__file__).parent.parent.joinpath("fixtures/distributions")
-    mocker.patch.object(
-        chef,
-        "get_cache_directory_for_link",
-        return_value=distributions,
-    )
-
-    archives = chef.get_cached_archives_for_link(
-        Link("https://files.python-poetry.org/demo-0.1.0.tar.gz")
-    )
-
-    assert archives
-    assert set(archives) == set(distributions.glob("demo-0.1.*"))
-
-
-def test_get_cache_directory_for_link(config: Config, config_cache_dir: Path):
-    chef = Chef(
-        config,
-        MockEnv(
-            marker_env={"interpreter_name": "cpython", "interpreter_version": "3.8.3"}
-        ),
-    )
-
-    directory = chef.get_cache_directory_for_link(
-        Link("https://files.python-poetry.org/poetry-1.1.0.tar.gz")
-    )
-
-    expected = Path(
-        f"{config_cache_dir.as_posix()}/artifacts/ba/63/13/"
-        "283a3b3b7f95f05e9e6f84182d276f7bb0951d5b0cc24422b33f7a4648"
-    )
-
-    assert directory == expected
-
-
-def test_prepare_sdist(config: Config, config_cache_dir: Path) -> None:
-    chef = Chef(config, EnvManager.get_system_env())
-
-    archive = (
-        Path(__file__)
-        .parent.parent.joinpath("fixtures/distributions/demo-0.1.0.tar.gz")
-        .resolve()
-    )
-
-    destination = chef.get_cache_directory_for_link(Link(archive.as_uri()))
+    archive = (fixture_dir("distributions") / "demo-0.1.0.tar.gz").resolve()
+    destination = artifact_cache.get_cache_directory_for_link(Link(archive.as_uri()))
 
     wheel = chef.prepare(archive)
 
@@ -141,41 +106,112 @@ def test_prepare_sdist(config: Config, config_cache_dir: Path) -> None:
     assert wheel.name == "demo-0.1.0-py3-none-any.whl"
 
 
-def test_prepare_directory(config: Config, config_cache_dir: Path):
-    chef = Chef(config, EnvManager.get_system_env())
-
-    archive = Path(__file__).parent.parent.joinpath("fixtures/simple_project").resolve()
+def test_prepare_directory(
+    config: Config,
+    config_cache_dir: Path,
+    artifact_cache: ArtifactCache,
+    fixture_dir: FixtureDirGetter,
+    mock_file_downloads: None,
+) -> None:
+    chef = Chef(
+        artifact_cache, EnvManager.get_system_env(), Factory.create_pool(config)
+    )
+    archive = fixture_dir("simple_project").resolve()
 
     wheel = chef.prepare(archive)
 
     assert wheel.name == "simple_project-1.2.3-py2.py3-none-any.whl"
 
+    assert wheel.parent.parent == Path(tempfile.gettempdir())
+    # cleanup generated tmp dir artifact
+    os.unlink(wheel)
 
+
+@pytest.mark.network
 def test_prepare_directory_with_extensions(
-    config: Config, config_cache_dir: Path
+    config: Config,
+    config_cache_dir: Path,
+    artifact_cache: ArtifactCache,
+    fixture_dir: FixtureDirGetter,
 ) -> None:
     env = EnvManager.get_system_env()
-    chef = Chef(config, env)
-
-    archive = (
-        Path(__file__)
-        .parent.parent.joinpath("fixtures/extended_with_no_setup")
-        .resolve()
-    )
+    chef = Chef(artifact_cache, env, Factory.create_pool(config))
+    archive = fixture_dir("extended_with_no_setup").resolve()
 
     wheel = chef.prepare(archive)
 
+    assert wheel.parent.parent == Path(tempfile.gettempdir())
     assert wheel.name == f"extended-0.1-{env.supported_tags[0]}.whl"
 
+    # cleanup generated tmp dir artifact
+    os.unlink(wheel)
 
-def test_prepare_directory_editable(config: Config, config_cache_dir: Path):
-    chef = Chef(config, EnvManager.get_system_env())
 
-    archive = Path(__file__).parent.parent.joinpath("fixtures/simple_project").resolve()
+def test_prepare_directory_editable(
+    config: Config,
+    config_cache_dir: Path,
+    artifact_cache: ArtifactCache,
+    fixture_dir: FixtureDirGetter,
+    mock_file_downloads: None,
+) -> None:
+    chef = Chef(
+        artifact_cache, EnvManager.get_system_env(), Factory.create_pool(config)
+    )
+    archive = fixture_dir("simple_project").resolve()
 
     wheel = chef.prepare(archive, editable=True)
 
+    assert wheel.parent.parent == Path(tempfile.gettempdir())
     assert wheel.name == "simple_project-1.2.3-py2.py3-none-any.whl"
 
     with ZipFile(wheel) as z:
         assert "simple_project.pth" in z.namelist()
+
+    # cleanup generated tmp dir artifact
+    os.unlink(wheel)
+
+
+@pytest.mark.network
+def test_prepare_directory_script(
+    config: Config,
+    config_cache_dir: Path,
+    artifact_cache: ArtifactCache,
+    fixture_dir: FixtureDirGetter,
+    tmp_path: Path,
+    mocker: MockerFixture,
+) -> None:
+    """
+    Building a project that requires calling a script from its build_requires.
+    """
+    # make sure the scripts project is on the same drive (for Windows tests in CI)
+    scripts_dir = tmp_path / "scripts"
+    shutil.copytree(fixture_dir("scripts"), scripts_dir)
+
+    orig_build_system_requires = ProjectBuilder.build_system_requires
+
+    class CustomPropertyMock:
+        def __get__(
+            self, obj: ProjectBuilder, obj_type: type[ProjectBuilder] | None = None
+        ) -> set[str]:
+            assert isinstance(obj, ProjectBuilder)
+            return {
+                req.replace("<scripts>", f"scripts @ {scripts_dir.as_uri()}")
+                for req in orig_build_system_requires.fget(obj)  # type: ignore[attr-defined]
+            }
+
+    mocker.patch(
+        "build.ProjectBuilder.build_system_requires",
+        new_callable=CustomPropertyMock,
+    )
+    chef = Chef(
+        artifact_cache, EnvManager.get_system_env(), Factory.create_pool(config)
+    )
+    archive = fixture_dir("project_with_setup_calls_script").resolve()
+
+    wheel = chef.prepare(archive)
+
+    assert wheel.name == "project_with_setup_calls_script-0.1.2-py3-none-any.whl"
+
+    assert wheel.parent.parent == Path(tempfile.gettempdir())
+    # cleanup generated tmp dir artifact
+    os.unlink(wheel)

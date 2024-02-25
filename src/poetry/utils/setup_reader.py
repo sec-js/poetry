@@ -3,10 +3,19 @@ from __future__ import annotations
 import ast
 
 from configparser import ConfigParser
-from pathlib import Path
+from typing import TYPE_CHECKING
 from typing import Any
+from typing import ClassVar
 
 from poetry.core.constraints.version import Version
+
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+
+class SetupReaderError(Exception):
+    pass
 
 
 class SetupReader:
@@ -14,21 +23,19 @@ class SetupReader:
     Class that reads a setup.py file without executing it.
     """
 
-    DEFAULT: dict[str, Any] = {
+    DEFAULT: ClassVar[dict[str, Any]] = {
         "name": None,
         "version": None,
+        "description": None,
         "install_requires": [],
         "extras_require": {},
         "python_requires": None,
     }
 
-    FILES = ["setup.py", "setup.cfg"]
+    FILES: ClassVar[list[str]] = ["setup.py", "setup.cfg"]
 
     @classmethod
-    def read_from_directory(cls, directory: str | Path) -> dict[str, Any]:
-        if isinstance(directory, str):
-            directory = Path(directory)
-
+    def read_from_directory(cls, directory: Path) -> dict[str, Any]:
         result = cls.DEFAULT.copy()
         for filename in cls.FILES:
             filepath = directory / filename
@@ -38,16 +45,13 @@ class SetupReader:
             read_file_func = getattr(cls(), "read_" + filename.replace(".", "_"))
             new_result = read_file_func(filepath)
 
-            for key in result.keys():
+            for key in result:
                 if new_result[key]:
                     result[key] = new_result[key]
 
         return result
 
-    def read_setup_py(self, filepath: str | Path) -> dict[str, Any]:
-        if isinstance(filepath, str):
-            filepath = Path(filepath)
-
+    def read_setup_py(self, filepath: Path) -> dict[str, Any]:
         with filepath.open(encoding="utf-8") as f:
             content = f.read()
 
@@ -63,6 +67,7 @@ class SetupReader:
         call, body = setup_call
         result["name"] = self._find_single_string(call, body, "name")
         result["version"] = self._find_single_string(call, body, "version")
+        result["description"] = self._find_single_string(call, body, "description")
         result["install_requires"] = self._find_install_requires(call, body)
         result["extras_require"] = self._find_extras_require(call, body)
         result["python_requires"] = self._find_single_string(
@@ -71,18 +76,22 @@ class SetupReader:
 
         return result
 
-    def read_setup_cfg(self, filepath: str | Path) -> dict[str, Any]:
+    def read_setup_cfg(self, filepath: Path) -> dict[str, Any]:
         parser = ConfigParser()
 
         parser.read(str(filepath))
 
         name = None
         version = None
+        description = None
         if parser.has_option("metadata", "name"):
             name = parser.get("metadata", "name")
 
         if parser.has_option("metadata", "version"):
             version = Version.parse(parser.get("metadata", "version")).text
+
+        if parser.has_option("metadata", "description"):
+            description = parser.get("metadata", "description")
 
         install_requires = []
         extras_require: dict[str, list[str]] = {}
@@ -113,6 +122,7 @@ class SetupReader:
         return {
             "name": name,
             "version": version,
+            "description": description,
             "install_requires": install_requires,
             "extras_require": extras_require,
             "python_requires": python_requires,
@@ -186,109 +196,95 @@ class SetupReader:
         return None
 
     def _find_install_requires(self, call: ast.Call, body: list[ast.stmt]) -> list[str]:
-        install_requires: list[str] = []
         value = self._find_in_call(call, "install_requires")
         if value is None:
             # Trying to find in kwargs
             kwargs = self._find_call_kwargs(call)
 
             if kwargs is None or not isinstance(kwargs, ast.Name):
-                return install_requires
+                return []
 
             variable = self._find_variable_in_body(body, kwargs.id)
-            if not isinstance(variable, (ast.Dict, ast.Call)):
-                return install_requires
 
-            if isinstance(variable, ast.Call):
-                if not isinstance(variable.func, ast.Name):
-                    return install_requires
-
-                if variable.func.id != "dict":
-                    return install_requires
-
-                value = self._find_in_call(variable, "install_requires")
-            else:
+            if isinstance(variable, ast.Dict):
                 value = self._find_in_dict(variable, "install_requires")
 
+            elif (
+                isinstance(variable, ast.Call)
+                and isinstance(variable.func, ast.Name)
+                and variable.func.id == "dict"
+            ):
+                value = self._find_in_call(variable, "install_requires")
+
+            else:
+                raise SetupReaderError(f"Cannot handle variable {variable}")
+
         if value is None:
-            return install_requires
+            return []
+
+        if isinstance(value, ast.Name):
+            value = self._find_variable_in_body(body, value.id)
+
+        if isinstance(value, ast.Constant) and value.value is None:
+            return []
 
         if isinstance(value, ast.List):
-            for el in value.elts:
-                if isinstance(el, ast.Str):
-                    install_requires.append(el.s)
-        elif isinstance(value, ast.Name):
-            variable = self._find_variable_in_body(body, value.id)
+            return string_list_values(value)
 
-            if variable is not None and isinstance(variable, ast.List):
-                for el in variable.elts:
-                    if isinstance(el, ast.Str):
-                        install_requires.append(el.s)
-
-        return install_requires
+        raise SetupReaderError(f"Cannot handle value of type {type(value)}")
 
     def _find_extras_require(
         self, call: ast.Call, body: list[ast.stmt]
     ) -> dict[str, list[str]]:
-        extras_require: dict[str, list[str]] = {}
         value = self._find_in_call(call, "extras_require")
         if value is None:
             # Trying to find in kwargs
             kwargs = self._find_call_kwargs(call)
 
             if kwargs is None or not isinstance(kwargs, ast.Name):
-                return extras_require
+                return {}
 
             variable = self._find_variable_in_body(body, kwargs.id)
-            if not isinstance(variable, (ast.Dict, ast.Call)):
-                return extras_require
-
-            if isinstance(variable, ast.Call):
-                if not isinstance(variable.func, ast.Name):
-                    return extras_require
-
-                if variable.func.id != "dict":
-                    return extras_require
-
-                value = self._find_in_call(variable, "extras_require")
-            else:
+            if isinstance(variable, ast.Dict):
                 value = self._find_in_dict(variable, "extras_require")
 
+            elif (
+                isinstance(variable, ast.Call)
+                and isinstance(variable.func, ast.Name)
+                and variable.func.id == "dict"
+            ):
+                value = self._find_in_call(variable, "extras_require")
+
+            else:
+                raise SetupReaderError(f"Cannot handle variable {variable}")
+
         if value is None:
-            return extras_require
+            return {}
+
+        if isinstance(value, ast.Name):
+            value = self._find_variable_in_body(body, value.id)
+
+        if isinstance(value, ast.Constant) and value.value is None:
+            return {}
 
         if isinstance(value, ast.Dict):
+            extras_require: dict[str, list[str]] = {}
             val: ast.expr | None
             for key, val in zip(value.keys, value.values):
-                if not isinstance(key, ast.Str):
-                    continue
+                if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+                    raise SetupReaderError(f"Cannot handle key {key}")
 
                 if isinstance(val, ast.Name):
                     val = self._find_variable_in_body(body, val.id)
 
-                if isinstance(val, ast.List):
-                    extras_require[key.s] = [
-                        e.s for e in val.elts if isinstance(e, ast.Str)
-                    ]
-        elif isinstance(value, ast.Name):
-            variable = self._find_variable_in_body(body, value.id)
+                if not isinstance(val, ast.List):
+                    raise SetupReaderError(f"Cannot handle value of type {type(val)}")
 
-            if variable is None or not isinstance(variable, ast.Dict):
-                return extras_require
+                extras_require[key.value] = string_list_values(val)
 
-            for key, val in zip(variable.keys, variable.values):
-                if not isinstance(key, ast.Str):
-                    continue
+            return extras_require
 
-                if isinstance(val, ast.Name):
-                    val = self._find_variable_in_body(body, val.id)
-
-                if isinstance(val, ast.List):
-                    extras_require[key.s] = [
-                        e.s for e in val.elts if isinstance(e, ast.Str)
-                    ]
-
-        return extras_require
+        raise SetupReaderError(f"Cannot handle value of type {type(value)}")
 
     def _find_single_string(
         self, call: ast.Call, body: list[ast.stmt], name: str
@@ -319,13 +315,17 @@ class SetupReader:
         if value is None:
             return None
 
-        if isinstance(value, ast.Str):
-            return value.s
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            return value.value
         elif isinstance(value, ast.Name):
             variable = self._find_variable_in_body(body, value.id)
 
-            if variable is not None and isinstance(variable, ast.Str):
-                return variable.s
+            if (
+                variable is not None
+                and isinstance(variable, ast.Constant)
+                and isinstance(variable.value, str)
+            ):
+                return variable.value
 
         return None
 
@@ -361,7 +361,23 @@ class SetupReader:
 
     def _find_in_dict(self, dict_: ast.Dict, name: str) -> ast.expr | None:
         for key, val in zip(dict_.keys, dict_.values):
-            if isinstance(key, ast.Str) and key.s == name:
+            if (
+                isinstance(key, ast.Constant)
+                and isinstance(key.value, str)
+                and key.value == name
+            ):
                 return val
 
         return None
+
+
+def string_list_values(value: ast.List) -> list[str]:
+    strings = []
+    for element in value.elts:
+        if isinstance(element, ast.Constant) and isinstance(element.value, str):
+            strings.append(element.value)
+
+        else:
+            raise SetupReaderError("Found non-string element in list")
+
+    return strings

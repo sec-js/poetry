@@ -27,7 +27,11 @@ class Transaction:
         self._root_package = root_package
 
     def calculate_operations(
-        self, with_uninstalls: bool = True, synchronize: bool = False
+        self,
+        with_uninstalls: bool = True,
+        synchronize: bool = False,
+        *,
+        skip_directory: bool = False,
     ) -> list[Operation]:
         from poetry.installation.operations import Install
         from poetry.installation.operations import Uninstall
@@ -70,7 +74,10 @@ class Transaction:
 
                     break
 
-            if not installed:
+            if not (
+                installed
+                or (skip_directory and result_package.source_type == "directory")
+            ):
                 operations.append(Install(result_package, priority=priority))
 
         if with_uninstalls:
@@ -91,14 +98,9 @@ class Transaction:
                 result_package_names = {
                     result_package.name for result_package, _ in self._result_packages
                 }
-                # We preserve pip/setuptools/wheel when not managed by poetry, this is
-                # done to avoid externally managed virtual environments causing
-                # unnecessary removals.
-                preserved_package_names = {
-                    "pip",
-                    "setuptools",
-                    "wheel",
-                } - result_package_names
+                # We preserve pip when not managed by poetry, this is done to avoid
+                # externally managed virtual environments causing unnecessary removals.
+                preserved_package_names = {"pip"} - result_package_names
 
                 for installed_package in self._installed_packages:
                     if installed_package.name in uninstalls:

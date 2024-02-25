@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-
-from tests.compat import Protocol
+from typing import Any
+from typing import Protocol
 
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    import requests
 
     from cleo.io.io import IO
     from cleo.testers.command_tester import CommandTester
@@ -27,13 +29,13 @@ class CommandTesterFactory(Protocol):
         installer: Installer | None = None,
         executor: Executor | None = None,
         environment: Env | None = None,
-    ) -> CommandTester:
-        ...
+    ) -> CommandTester: ...
 
 
 class SourcesFactory(Protocol):
-    def __call__(self, poetry: Poetry, sources: Source, config: Config, io: IO) -> None:
-        ...
+    def __call__(
+        self, poetry: Poetry, sources: Source, config: Config, io: IO
+    ) -> None: ...
 
 
 class ProjectFactory(Protocol):
@@ -46,15 +48,22 @@ class ProjectFactory(Protocol):
         poetry_lock_content: str | None = None,
         install_deps: bool = True,
         source: Path | None = None,
-    ) -> Poetry:
-        ...
+        locker_config: dict[str, Any] | None = None,
+        use_test_locker: bool = True,
+    ) -> Poetry: ...
 
 
 class FixtureDirGetter(Protocol):
-    def __call__(self, name: str) -> Path:
-        ...
+    def __call__(self, name: str) -> Path: ...
 
 
 class FixtureCopier(Protocol):
-    def __call__(self, relative_path: str, target: Path | None = None) -> Path:
-        ...
+    def __call__(self, relative_path: str, target: Path | None = None) -> Path: ...
+
+
+class HTMLPageGetter(Protocol):
+    def __call__(self, content: str, base_url: str | None = None) -> str: ...
+
+
+class RequestsSessionGet(Protocol):
+    def __call__(self, url: str, **__: Any) -> requests.Response: ...

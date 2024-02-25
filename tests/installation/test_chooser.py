@@ -58,7 +58,7 @@ def mock_pypi(http: type[httpretty.httpretty]) -> None:
             fixture = JSON_FIXTURES / (name + ".json")
 
         if not fixture.exists():
-            return
+            return None
 
         with fixture.open(encoding="utf-8") as f:
             return [200, headers, f.read()]
@@ -132,7 +132,7 @@ def test_chooser_chooses_universal_wheel_link_if_available(
     mock_legacy: None,
     source_type: str,
     pool: RepositoryPool,
-):
+) -> None:
     chooser = Chooser(pool, env)
 
     package = Package("pytest", "3.5.0")
@@ -170,7 +170,7 @@ def test_chooser_no_binary_policy(
     policy: str,
     filename: str,
     config: Config,
-):
+) -> None:
     config.merge({"installer": {"no-binary": policy.split(",")}})
 
     chooser = Chooser(pool, env, config)
@@ -197,7 +197,7 @@ def test_chooser_chooses_specific_python_universal_wheel_link_if_available(
     mock_legacy: None,
     source_type: str,
     pool: RepositoryPool,
-):
+) -> None:
     chooser = Chooser(pool, env)
 
     package = Package("isort", "4.3.4")
@@ -218,7 +218,7 @@ def test_chooser_chooses_specific_python_universal_wheel_link_if_available(
 @pytest.mark.parametrize("source_type", ["", "legacy"])
 def test_chooser_chooses_system_specific_wheel_link_if_available(
     mock_pypi: None, mock_legacy: None, source_type: str, pool: RepositoryPool
-):
+) -> None:
     env = MockEnv(
         supported_tags=[Tag("cp37", "cp37m", "win32"), Tag("py3", "none", "any")]
     )
@@ -246,7 +246,7 @@ def test_chooser_chooses_sdist_if_no_compatible_wheel_link_is_available(
     mock_legacy: None,
     source_type: str,
     pool: RepositoryPool,
-):
+) -> None:
     chooser = Chooser(pool, env)
 
     package = Package("pyyaml", "3.13.0")
@@ -271,13 +271,15 @@ def test_chooser_chooses_distributions_that_match_the_package_hashes(
     mock_legacy: None,
     source_type: str,
     pool: RepositoryPool,
-):
+) -> None:
     chooser = Chooser(pool, env)
 
     package = Package("isort", "4.3.4")
     files = [
         {
-            "hash": "sha256:b9c40e9750f3d77e6e4d441d8b0266cf555e7cdabdcff33c4fd06366ca761ef8",  # noqa: E501
+            "hash": (
+                "sha256:b9c40e9750f3d77e6e4d441d8b0266cf555e7cdabdcff33c4fd06366ca761ef8"
+            ),
             "filename": "isort-4.3.4.tar.gz",
         }
     ]
@@ -311,7 +313,9 @@ def test_chooser_chooses_yanked_if_no_others(
     files = [
         {
             "filename": "black-21.11b0-py3-none-any.whl",
-            "hash": "sha256:0b1f66cbfadcd332ceeaeecf6373d9991d451868d2e2219ad0ac1213fb701117",  # noqa: E501
+            "hash": (
+                "sha256:0b1f66cbfadcd332ceeaeecf6373d9991d451868d2e2219ad0ac1213fb701117"
+            ),
         }
     ]
     if source_type == "legacy":
@@ -342,11 +346,11 @@ def test_chooser_does_not_choose_yanked_if_others(
     files = [
         {
             "filename": "futures-3.2.0-py2-none-any.whl",
-            "hash": "sha256:ec0a6cb848cc212002b9828c3e34c675e0c9ff6741dc445cab6fdd4e1085d1f1",  # noqa: E501
+            "hash": "sha256:ec0a6cb848cc212002b9828c3e34c675e0c9ff6741dc445cab6fdd4e1085d1f1",
         },
         {
             "filename": "futures-3.2.0.tar.gz",
-            "hash": "sha256:9ec02aa7d674acb8618afb127e27fde7fc68994c0437ad759fa094a574adb265",  # noqa: E501
+            "hash": "sha256:9ec02aa7d674acb8618afb127e27fde7fc68994c0437ad759fa094a574adb265",
         },
     ]
     package = Package(
@@ -381,13 +385,15 @@ def test_chooser_throws_an_error_if_package_hashes_do_not_match(
     mock_legacy: None,
     source_type: None,
     pool: RepositoryPool,
-):
+) -> None:
     chooser = Chooser(pool, env)
 
     package = Package("isort", "4.3.4")
     files = [
         {
-            "hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",  # noqa: E501
+            "hash": (
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            ),
             "filename": "isort-4.3.4.tar.gz",
         }
     ]
@@ -405,3 +411,27 @@ def test_chooser_throws_an_error_if_package_hashes_do_not_match(
     with pytest.raises(RuntimeError) as e:
         chooser.choose_for(package)
     assert files[0]["hash"] in str(e)
+
+
+@pytest.mark.usefixtures("mock_legacy")
+def test_chooser_md5_remote_fallback_to_sha256_inline_calculation(
+    env: MockEnv, pool: RepositoryPool
+) -> None:
+    chooser = Chooser(pool, env)
+    package = Package(
+        "demo",
+        "0.1.0",
+        source_type="legacy",
+        source_reference="foo",
+        source_url="https://foo.bar/simple/",
+    )
+    package.files = [
+        {
+            "hash": (
+                "sha256:9fa123ad707a5c6c944743bf3e11a0e80d86cb518d3cf25320866ca3ef43e2ad"
+            ),
+            "filename": "demo-0.1.0.tar.gz",
+        }
+    ]
+    res = chooser.choose_for(package)
+    assert res.filename == "demo-0.1.0.tar.gz"
